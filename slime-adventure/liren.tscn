@@ -1,0 +1,40 @@
+[gd_scene format=3 uid="uid://e7gc80yrkav0"]
+
+[ext_resource type="Script" uid="uid://cn0jhwrnsgmxe" path="res://liren.gd" id="1"]
+[ext_resource type="PackedScene" path="res://scenes/maps/campus_map.tscn" id="2"]
+[ext_resource type="PackedScene" uid="uid://iutfxewlounk" path="res://scenes/characters/player.tscn" id="3"]
+[ext_resource type="PackedScene" path="res://scenes/characters/npc.tscn" id="4"]
+
+[node name="立仁" type="Node2D" unique_id=963709977]
+script = ExtResource("1")
+
+[node name="Map" parent="." unique_id=1814550207 instance=ExtResource("2")]
+
+[node name="Player" parent="." unique_id=370198955 instance=ExtResource("3")]
+position = Vector2(800, 2020)
+speed = 650.0
+
+[node name="NPC" parent="." unique_id=400012867 instance=ExtResource("4")]
+visible = false
+position = Vector2(640, 250)
+dialogue = "米猴来了，小米最忠诚的野狗
+基基你废了，又在看你的破手表"
+
+[node name="HUD" type="CanvasLayer" parent="." unique_id=781881826]
+layer = 20
+
+[node name="Panel" type="ColorRect" parent="HUD" unique_id=837067616]
+offset_left = 12.0
+offset_top = 12.0
+offset_right = 672.0
+offset_bottom = 140.0
+mouse_filter = 2
+color = Color(0.04, 0.06, 0.09, 0.92)
+
+[node name="StatusLabel" type="Label" parent="HUD" unique_id=1717922320]
+offset_left = 24.0
+offset_top = 20.0
+offset_right = 660.0
+offset_bottom = 136.0
+theme_override_font_sizes/font_size = 18
+text = "科技技 | 校园 G0"
