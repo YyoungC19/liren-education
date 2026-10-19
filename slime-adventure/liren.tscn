@@ -4,21 +4,30 @@
 [ext_resource type="PackedScene" path="res://scenes/maps/campus_map.tscn" id="2"]
 [ext_resource type="PackedScene" uid="uid://iutfxewlounk" path="res://scenes/characters/player.tscn" id="3"]
 [ext_resource type="PackedScene" path="res://scenes/characters/npc.tscn" id="4"]
+[ext_resource type="PackedScene" path="res://scenes/characters/llx.tscn" id="5"]
+[ext_resource type="PackedScene" path="res://scenes/characters/shop_merchant.tscn" id="6"]
 
 [node name="立仁" type="Node2D" unique_id=963709977]
 script = ExtResource("1")
 
 [node name="Map" parent="." unique_id=1814550207 instance=ExtResource("2")]
+texture_filter = 1
 
 [node name="Player" parent="." unique_id=370198955 instance=ExtResource("3")]
 position = Vector2(800, 2020)
-speed = 650.0
+speed = 1000.0
 
 [node name="NPC" parent="." unique_id=400012867 instance=ExtResource("4")]
 visible = false
-position = Vector2(640, 250)
+position = Vector2(935, 1120)
 dialogue = "米猴来了，小米最忠诚的野狗
 基基你废了，又在看你的破手表"
+
+[node name="LLX" parent="." unique_id=1536628201 instance=ExtResource("5")]
+position = Vector2(260, 274)
+
+[node name="ShopMerchant" parent="." unique_id=1687051142 instance=ExtResource("6")]
+position = Vector2(480, 390)
 
 [node name="HUD" type="CanvasLayer" parent="." unique_id=781881826]
 layer = 20

@@ -244,7 +244,7 @@ func _input(event: InputEvent) -> void:
 	var key: int = event.physical_keycode if event.physical_keycode != 0 else event.keycode
 	if not is_open():
 		if key not in [KEY_X, KEY_G] or event.echo: return
-		if not controller.message.is_empty() or controller.noticeboard_view.visible: return
+		if not controller.message.is_empty() or controller.noticeboard_view.visible or controller.bed_transition_busy: return
 		open("menu" if key == KEY_X else "watch")
 	else:
 		if event.echo and key not in [KEY_LEFT, KEY_RIGHT, KEY_UP, KEY_DOWN]:

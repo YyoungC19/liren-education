@@ -4,6 +4,7 @@ extends CharacterBody2D
 @export var speed: float = 120.0
 var movement_enabled: bool = true
 var facing: String = "down"
+var pose_override: StringName = &""
 @onready var sprite: AnimatedSprite2D = $AnimatedSprite2D
 
 func _ready() -> void:
@@ -26,6 +27,9 @@ func _physics_process(_delta: float) -> void:
 			facing = "right" if direction.x > 0 else "left"
 		else:
 			facing = "down" if direction.y > 0 else "up"
+	if pose_override != &"" and sprite.sprite_frames.has_animation(pose_override):
+		sprite.play(pose_override)
+		return
 	var animation_name: String = ("walk_" if direction != Vector2.ZERO else "idle_") + facing
 	if sprite.sprite_frames.has_animation(animation_name):
 		sprite.play(animation_name)

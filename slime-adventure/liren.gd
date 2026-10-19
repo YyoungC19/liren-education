@@ -9,14 +9,46 @@ extends Node2D
 @onready var map = $Map
 @onready var player = $Player
 @onready var npc = $NPC
+@onready var office_npc = $LLX
+@onready var shop_merchant = $ShopMerchant
+var dialogue_speaker: String = ""
 @onready var camera: Camera2D = $Player/Camera2D
 @onready var hud: Label = $HUD/StatusLabel
 
+const TIME_TINTS := [Color(0.98, 0.99, 1.0), Color(1.0, 1.0, 1.0), Color(1.0, 0.88, 0.68), Color(0.30, 0.33, 0.40)]
+# 夜间室内使用暖白灯光，保留充足亮度；开放平台、外走廊仍使用室外夜色。
+const INDOOR_NIGHT_TINT := Color(0.96, 0.91, 0.82)
+const INDOOR_PLACES := [
+	"教学楼男厕", "二层第一教室", "一楼办公室", "食堂内部",
+	"二号空房间", "小卖部内部", "白房内部", "宿舍一楼小房间",
+	"男生宿舍内部", "男生宿舍 F2", "男生宿舍 F3",
+	"宿舍尽头房间一", "宿舍尽头房间二"
+]
+const TIME_DAYLIGHT := [0.9, 1.0, 0.7, 0.0]
+var world_time_tint: CanvasModulate
+var time_tint_tween: Tween
+var day_cycle = preload("res://scripts/day_cycle.gd").new()
+var time_label: Label
+var bed_visit_rest_used: bool = false
+var active_bed_ladder: Node2D
+var bed_transition_busy: bool = false
+var bed_ladder_tween: Tween
+var bed_saved_z_index: int = 0
 var game_menu: CanvasLayer
+var debug_panel: CanvasLayer
 var place: String = ""
 var dorm_transition_cooldown: float = 0.0
 var teaching_restroom_return_floor: int = 1
 var message: String = ""
+# 饭票按日期和时段记录，切换地图不会重置。
+var meal_slot: String = ""
+var meal_taken: bool = false
+var completed_meals: Dictionary = {}
+var meal_seated: bool = false
+var meal_dialogue_active: bool = false
+var meal_return_position: Vector2
+var meal_saved_sprite_position: Vector2
+var meal_saved_facing: String
 
 var dialogue_lines: PackedStringArray = []
 var dialogue_index: int = 0
@@ -34,9 +66,16 @@ var portrait_image: TextureRect
 func _ready() -> void:
 	_setup_dialogue()
 	_setup_noticeboard()
+	_setup_time_ui()
+	_setup_meal_seat_animation()
+	_setup_time_tint()
+	day_cycle.changed.connect(_sync_time_points)
 	game_menu = load("res://scripts/rpg_menu.gd").new()
 	add_child(game_menu)
 	game_menu.menu_state_changed.connect(_sync_player_controls)
+	debug_panel = load("res://scripts/debug_panel.gd").new()
+	add_child(debug_panel)
+	debug_panel.panel_state_changed.connect(_sync_player_controls)
 	_load_place("校园 G0", Vector2(800, 2020))
 
 
@@ -44,8 +83,9 @@ func _process(_delta: float) -> void:
 	dorm_transition_cooldown = maxf(dorm_transition_cooldown - _delta, 0.0)
 	_update_dorm_stairs()
 	_update_dialogue()
+	_update_time_ui()
 
-	if place in ["教学楼 F2", "教学楼 F3", "教学楼 F4", "教学楼 F5", "教学楼男厕", "食堂内部", "二号空房间", "小卖部内部", "白房内部", "二层第一教室", "一楼办公室"]:
+	if place in ["教学楼 F2", "教学楼 F3", "教学楼 F4", "教学楼 F5", "教学楼男厕", "食堂内部", "二号空房间", "小卖部内部", "白房内部", "宿舍一楼小房间", "二层第一教室", "一楼办公室"]:
 		_frame_area()
 
 	_sync_player_controls()
@@ -63,6 +103,8 @@ func _process(_delta: float) -> void:
 
 	if noticeboard_view.visible:
 		hint = "查看布告板中，按 E 关闭"
+	if bed_transition_busy:
+		hint = "正在沿梯子上下床……"
 
 	var area_name: String = place
 	if place == "男生宿舍内部":
@@ -77,7 +119,7 @@ func _process(_delta: float) -> void:
 		player.display_name
 		+ "  |  "
 		+ area_name
-		+ "\n方向键 / WASD 移动，E 互动\nX 菜单 · G 手表\n"
+		+ "\n方向键 / WASD 移动，E 互动\nX 菜单 · G 手表 · = 调试\n"
 		+ hint
 	)
 
@@ -207,11 +249,16 @@ func _update_dialogue() -> void:
 
 
 func _start_cb_dialogue() -> void:
+	_start_npc_dialogue(npc)
+
+
+func _start_npc_dialogue(speaker: Node) -> void:
 	dialogue_lines.clear()
 	dialogue_index = 0
 
 	# Dialogue 中每个实际换行代表下一段，空行会跳过。
-	for line in npc.dialogue.split("\n"):
+	dialogue_speaker = speaker.display_name
+	for line in speaker.dialogue.split("\n"):
 		var text: String = line.strip_edges()
 
 		if not text.is_empty():
@@ -220,16 +267,27 @@ func _start_cb_dialogue() -> void:
 	if dialogue_lines.is_empty():
 		dialogue_lines.append("……")
 
-	message = npc.display_name + "：" + dialogue_lines[0]
+	message = dialogue_speaker + "：" + dialogue_lines[0]
 
 
 func _unhandled_input(event: InputEvent) -> void:
 	if event is InputEventKey and event.pressed and not event.echo:
 		if event.physical_keycode == KEY_E:
 			_interact()
+		elif event.physical_keycode == KEY_Q and is_instance_valid(active_bed_ladder) and message.is_empty() and not noticeboard_view.visible:
+			_start_bed_climb(active_bed_ladder, false)
 
 
 func _nearest_point() -> Dictionary:
+	if bed_transition_busy:
+		return {}
+	if is_instance_valid(active_bed_ladder):
+		var rest_point := _current_bed_rest_point()
+		if not rest_point.is_empty():
+			rest_point = rest_point.duplicate()
+			rest_point["title"] += "（Q 下床）"
+			return rest_point
+		return {"title": "沿梯子下床", "action": "bed_ladder_down"}
 	var result: Dictionary = {}
 	var best_distance: float = INF
 	var candidates: Array[Dictionary] = map.points.duplicate()
@@ -242,10 +300,18 @@ func _nearest_point() -> Dictionary:
 			"radius": 80.0
 		})
 
+	if office_npc.visible:
+		candidates.append({
+			"pos": office_npc.global_position,
+			"title": "与 llx 对话", "action": "llx", "radius": 85.0
+		})
+
 	for point in candidates:
+		if not point.get("enabled", true):
+			continue
 		var target: Vector2 = point["pos"]
 		var radius: float = float(point.get("radius", 80.0))
-		if str(point["action"]) != "cb":
+		if str(point["action"]) not in ["cb", "llx"]:
 			if point.has("interaction_rect"):
 				var area: Rect2 = point["interaction_rect"]
 				var local_player: Vector2 = map.to_local(player.global_position)
@@ -263,6 +329,8 @@ func _nearest_point() -> Dictionary:
 
 
 func _interact() -> void:
+	if bed_transition_busy or (debug_panel != null and debug_panel.is_open()):
+		return
 	if noticeboard_view.visible:
 		noticeboard_view.hide()
 		player.movement_enabled = true
@@ -275,7 +343,7 @@ func _interact() -> void:
 		):
 			dialogue_index += 1
 			message = (
-				npc.display_name
+				dialogue_speaker
 				+ "："
 				+ dialogue_lines[dialogue_index]
 			)
@@ -283,6 +351,8 @@ func _interact() -> void:
 			message = ""
 			dialogue_lines.clear()
 			dialogue_index = 0
+			_end_meal_seating()
+			meal_dialogue_active = false
 
 		_sync_player_controls()
 		_update_dialogue()
@@ -296,6 +366,22 @@ func _interact() -> void:
 	var action: String = point["action"]
 
 	match action:
+		"canteen_take_meal", "canteen_eat_meal":
+			_use_canteen_meal(action)
+
+		"time_classroom":
+			_advance_day_period("classroom")
+
+		"time_rest_noon":
+			_advance_day_period("rest", 1)
+
+		"time_rest_night":
+			_advance_day_period("rest", 3)
+		"bed_ladder_up":
+			_start_bed_climb(point["ladder"], true)
+
+		"bed_ladder_down":
+			_start_bed_climb(active_bed_ladder, false)
 		"rest_dorm_locked":
 			message = "这边是宿舍，暂时不能进入。"
 
@@ -387,6 +473,12 @@ func _interact() -> void:
 		"room_closed":
 			message = str(point["title"]) + "暂未开放。"
 
+		"shop_merchant":
+			_start_npc_dialogue(shop_merchant)
+
+		"llx":
+			_start_npc_dialogue(office_npc)
+
 		"cb":
 			_start_cb_dialogue()
 
@@ -398,6 +490,12 @@ func _interact() -> void:
 
 		"dorm_female":
 			message = "此入口仅限女生进入，请从右侧男生宿舍入口进入。"
+
+		"dorm_small_room_enter":
+			_load_place("宿舍一楼小房间", Vector2(350, 390))
+
+		"dorm_small_room_exit":
+			_load_place("男生宿舍内部", Vector2(4480, 310))
 
 		"dorm_male_enter":
 			_load_place("男生宿舍内部", Vector2(4690, 560))
@@ -450,6 +548,9 @@ func _interact() -> void:
 
 
 func _load_place(next_place: String, spawn: Vector2) -> void:
+	_end_meal_seating()
+	meal_dialogue_active = false
+	_reset_bed_climb()
 	if next_place == "教学楼 F1":
 		next_place = "教学楼前平台"
 
@@ -462,10 +563,15 @@ func _load_place(next_place: String, spawn: Vector2) -> void:
 
 	map.configure(place)
 	npc.set_active(place == "二层第一教室")
+	office_npc.set_active(place == "一楼办公室")
+	shop_merchant.set_active(place == "小卖部内部")
 
 	var outside: bool = place in ["校园 G0", "教学楼前平台", "休息区"]
 	var world_scale: float = sqrt(outdoor_area_multiplier) if outside else 1.0
 	map.scale = Vector2.ONE * world_scale
+	npc.global_position = map.to_global(Vector2(935, 1120))
+	office_npc.global_position = map.to_global(Vector2(260, 274))
+	shop_merchant.global_position = map.to_global(Vector2(480, 390))
 	player.position = spawn * world_scale
 	player.velocity = Vector2.ZERO
 	player.movement_enabled = true
@@ -478,12 +584,15 @@ func _load_place(next_place: String, spawn: Vector2) -> void:
 	camera.position = Vector2.ZERO
 
 	_update_dialogue()
+	_update_time_ui()
 
-	if place in ["教学楼 F2", "教学楼 F3", "教学楼 F4", "教学楼 F5", "教学楼男厕", "食堂内部", "二号空房间", "小卖部内部", "白房内部", "二层第一教室", "一楼办公室"]:
+	if place in ["教学楼 F2", "教学楼 F3", "教学楼 F4", "教学楼 F5", "教学楼男厕", "食堂内部", "二号空房间", "小卖部内部", "白房内部", "宿舍一楼小房间", "二层第一教室", "一楼办公室"]:
 		_frame_area()
 
 	camera.reset_smoothing()
 	camera.force_update_scroll()
+	_apply_time_tint(true)
+	_sync_time_points()
 
 
 func _frame_area() -> void:
@@ -520,7 +629,7 @@ func _frame_area() -> void:
 	camera.limit_bottom = 100000
 
 func _update_dorm_stairs() -> void:
-	if dorm_transition_cooldown > 0.0 or not message.is_empty() or noticeboard_view.visible or (game_menu != null and game_menu.is_open()):
+	if (debug_panel != null and debug_panel.is_open()) or dorm_transition_cooldown > 0.0 or not message.is_empty() or noticeboard_view.visible or (game_menu != null and game_menu.is_open()):
 		return
 	if place not in ["男生宿舍内部", "男生宿舍 F2", "男生宿舍 F3"]:
 		return
@@ -529,7 +638,7 @@ func _update_dorm_stairs() -> void:
 		if trigger.has_point(player.position):
 			var floor_number: int = map._dorm_floor_number() + int(transition["step"])
 			var next_place: String = "男生宿舍内部" if floor_number == 1 else "男生宿舍 F%d" % floor_number
-			var arrival_x: float = 4550.0 if int(transition["step"]) > 0 else 4690.0
+			var arrival_x: float = 4550.0 if int(transition["step"]) > 0 else (4670.0 if floor_number == 1 else 4690.0)
 			_load_place(next_place, Vector2(arrival_x, 410))
 			return
 
@@ -585,4 +694,273 @@ func _enter_teaching_west_floor(floor_number: int) -> void:
 	_load_place("教学楼 F%d" % floor_number, Vector2(-20, top + 136))
 
 func _sync_player_controls() -> void:
-	player.movement_enabled = message.is_empty() and not noticeboard_view.visible and (game_menu == null or not game_menu.is_open())
+	player.movement_enabled = (debug_panel == null or not debug_panel.is_open()) and message.is_empty() and not noticeboard_view.visible and (game_menu == null or not game_menu.is_open()) and not meal_seated and not bed_transition_busy and not is_instance_valid(active_bed_ladder)
+
+func _bed_landing_is_clear(ladder: Node2D) -> bool:
+	var query := PhysicsShapeQueryParameters2D.new()
+	query.shape = $Player/CollisionShape2D.shape
+	query.transform = Transform2D(0.0, ladder.get_landing_position())
+	query.collision_mask = player.collision_mask
+	query.exclude = [player.get_rid()]
+	return get_world_2d().direct_space_state.intersect_shape(query, 1).is_empty()
+
+
+func _start_bed_climb(ladder: Node2D, going_up: bool) -> void:
+	if bed_transition_busy or not is_instance_valid(ladder):
+		return
+	if not _bed_landing_is_clear(ladder):
+		message = "梯子下方被挡住了，暂时不能上下床。"
+		return
+	bed_transition_busy = true
+	if going_up:
+		bed_visit_rest_used = false
+		bed_saved_z_index = player.z_index
+		active_bed_ladder = ladder
+	player.velocity = Vector2.ZERO
+	player.z_index = 2
+	$Player/CollisionShape2D.set_deferred("disabled", true)
+	_sync_player_controls()
+	player.facing = "up" if going_up else "down"
+	player.sprite.play("idle_" + player.facing)
+	bed_ladder_tween = create_tween()
+	bed_ladder_tween.set_process_mode(Tween.TWEEN_PROCESS_PHYSICS)
+	if going_up:
+		bed_ladder_tween.tween_property(player, "global_position", ladder.get_landing_position(), 0.12)
+		bed_ladder_tween.tween_property(player, "global_position", ladder.get_foot_position(), 0.12)
+		bed_ladder_tween.tween_property(player, "global_position", ladder.global_position, 0.65)
+		bed_ladder_tween.tween_property(player, "global_position", _bed_upper_arrival(ladder), 0.15)
+	else:
+		bed_ladder_tween.tween_property(player, "global_position", ladder.global_position, 0.15)
+		bed_ladder_tween.tween_property(player, "global_position", ladder.get_foot_position(), 0.65)
+		bed_ladder_tween.tween_property(player, "global_position", ladder.get_landing_position(), 0.12)
+	await bed_ladder_tween.finished
+	bed_transition_busy = false
+	if not going_up:
+		active_bed_ladder = null
+		player.z_index = bed_saved_z_index
+		$Player/CollisionShape2D.set_deferred("disabled", false)
+	player.velocity = Vector2.ZERO
+	_sync_player_controls()
+	_sync_time_points()
+
+
+func _reset_bed_climb() -> void:
+	if is_instance_valid(bed_ladder_tween):
+		bed_ladder_tween.kill()
+	if is_instance_valid(active_bed_ladder):
+		player.z_index = bed_saved_z_index
+	active_bed_ladder = null
+	bed_visit_rest_used = false
+	bed_transition_busy = false
+	$Player/CollisionShape2D.set_deferred("disabled", false)
+func _setup_time_ui() -> void:
+	var badge := PanelContainer.new()
+	badge.name = "DayPeriodBadge"
+	$HUD.add_child(badge)
+	badge.anchor_left = 1.0
+	badge.anchor_right = 1.0
+	badge.offset_left = -280.0
+	badge.offset_right = -24.0
+	badge.offset_top = 20.0
+	badge.offset_bottom = 78.0
+	badge.mouse_filter = Control.MOUSE_FILTER_IGNORE
+	var style := StyleBoxFlat.new()
+	style.bg_color = Color(0.04, 0.08, 0.12, 0.94)
+	style.border_color = Color("#a9b9b4")
+	style.set_border_width_all(2)
+	style.set_corner_radius_all(8)
+	badge.add_theme_stylebox_override("panel", style)
+	time_label = Label.new()
+	time_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	time_label.vertical_alignment = VERTICAL_ALIGNMENT_CENTER
+	time_label.add_theme_font_size_override("font_size", 24)
+	badge.add_child(time_label)
+	_update_time_ui()
+
+
+func _update_time_ui() -> void:
+	if time_label != null:
+		time_label.text = day_cycle.display_text()
+
+
+func _can_rest_on_bed() -> bool:
+	return place == "宿舍尽头房间一" and is_instance_valid(active_bed_ladder) and active_bed_ladder.bed_number == 1 and not bed_transition_busy and not bed_visit_rest_used and day_cycle.can_advance("rest")
+
+
+func _sync_time_points() -> void:
+	_sync_meal_points()
+	for point in map.points:
+		if point["action"] == "time_classroom":
+			var available: bool = place == "二层第一教室" and day_cycle.can_advance("classroom")
+			point["enabled"] = available
+			point["show_ring"] = available
+			point["title"] = "上课到" + day_cycle.next_period_text("classroom")
+		elif point["action"] in ["time_rest_noon", "time_rest_night"]:
+			# 两个独立光圈，夜间光圈在左；只显示当前时段允许使用的一个。
+			point["enabled"] = false
+			point["show_ring"] = place == "宿舍尽头房间一" and day_cycle.period == point["rest_period"] and not bed_visit_rest_used
+			point["title"] = "午休到下午" if point["rest_period"] == 1 else "睡到第%d天早上" % (day_cycle.day + 1)
+	map.queue_redraw()
+	_update_time_ui()
+
+
+func _advance_day_period(source: String, expected_period: int = -1) -> void:
+	if source == "classroom":
+		if place != "二层第一教室" or is_instance_valid(active_bed_ladder): return
+	elif source == "rest":
+		if expected_period not in [1, 3] or day_cycle.period != expected_period: return
+		var rest_point := _current_bed_rest_point()
+		if rest_point.is_empty() or rest_point.get("rest_period", -1) != expected_period: return
+		bed_visit_rest_used = true
+	else:
+		return
+	if day_cycle.advance(source):
+		message = ("课程结束，" if source == "classroom" else "休息结束，") + "现在是" + day_cycle.display_text() + "。"
+		_sync_player_controls()
+		_update_dialogue()
+func _setup_time_tint() -> void:
+	# 世界与 HUD 分属不同 Canvas，菜单和对白不受夜间变暗影响。
+	world_time_tint = CanvasModulate.new()
+	world_time_tint.name = "WorldTimeTint"
+	add_child(world_time_tint)
+	world_time_tint.color = _time_tint_for_place()
+	map.classroom_daylight_strength = TIME_DAYLIGHT[day_cycle.period]
+	map.night_light_strength = 1.0 if day_cycle.period == 3 else 0.0
+	day_cycle.changed.connect(_apply_time_tint)
+
+
+func _time_tint_for_place() -> Color:
+	if day_cycle.period == 3 and place in INDOOR_PLACES:
+		return INDOOR_NIGHT_TINT
+	return TIME_TINTS[day_cycle.period]
+
+
+func _apply_time_tint(immediate: bool = false) -> void:
+	if is_instance_valid(time_tint_tween):
+		time_tint_tween.kill()
+	if immediate:
+		world_time_tint.color = _time_tint_for_place()
+		map.classroom_daylight_strength = TIME_DAYLIGHT[day_cycle.period]
+		map.night_light_strength = 1.0 if day_cycle.period == 3 else 0.0
+		return
+	time_tint_tween = create_tween().set_parallel(true)
+	time_tint_tween.set_trans(Tween.TRANS_SINE).set_ease(Tween.EASE_IN_OUT)
+	time_tint_tween.tween_property(world_time_tint, "color", _time_tint_for_place(), 0.6)
+	time_tint_tween.tween_property(map, "classroom_daylight_strength", TIME_DAYLIGHT[day_cycle.period], 0.6)
+	time_tint_tween.tween_property(map, "night_light_strength", 1.0 if day_cycle.period == 3 else 0.0, 0.6)
+func _bed_upper_arrival(ladder: Node2D) -> Vector2:
+	var position_on_bed: Vector2 = ladder.get_upper_position()
+	if place == "宿舍尽头房间一" and ladder.bed_number == 1 and day_cycle.period == 3:
+		position_on_bed += map.to_global(Vector2(-65, 0)) - map.to_global(Vector2.ZERO)
+	return position_on_bed
+
+
+func _current_bed_rest_point() -> Dictionary:
+	if not _can_rest_on_bed(): return {}
+	for point in map.points:
+		if point.get("rest_period", -1) != day_cycle.period: continue
+		if not point.get("show_ring", false): continue
+		var target: Vector2 = map.to_global(point["pos"])
+		if player.global_position.distance_to(target) <= float(point["radius"]) * map.global_scale.x:
+			return point
+	return {}
+
+
+func _debug_step_time(direction: int) -> void:
+	if bed_transition_busy: return
+	var was_used: bool = bed_visit_rest_used
+	bed_visit_rest_used = false
+	if not day_cycle.debug_step(direction):
+		bed_visit_rest_used = was_used
+		return
+	if is_instance_valid(active_bed_ladder):
+		player.global_position = _bed_upper_arrival(active_bed_ladder)
+	_sync_time_points()
+	_sync_player_controls()
+
+func _meal_slot_key() -> String:
+	return "%d:%d" % [day_cycle.day, day_cycle.period]
+
+func _sync_meal_points() -> void:
+	var current_slot := _meal_slot_key()
+	if meal_slot != current_slot:
+		_end_meal_seating()
+		if meal_dialogue_active:
+			message = ""
+			dialogue_lines.clear()
+			meal_dialogue_active = false
+		meal_slot = current_slot
+		meal_taken = false
+	var available: bool = day_cycle.period in [1, 3] and not completed_meals.has(current_slot)
+	for point in map.points:
+		if point["action"] == "canteen_take_meal":
+			point["show_ring"] = available and not meal_taken
+			point["title"] = "取饭" if not meal_taken else "已经取饭，请到中间座位吃饭"
+		elif point["action"] == "canteen_eat_meal":
+			point["show_ring"] = available
+			point["title"] = "坐下吃饭" if meal_taken else "吃饭（请先取饭）"
+
+func _use_canteen_meal(action: String) -> void:
+	if place != "食堂内部" or action not in ["canteen_take_meal", "canteen_eat_meal"]: return
+	var in_reach := false
+	for point in map.points:
+		if point["action"] == action:
+			in_reach = player.global_position.distance_to(map.to_global(point["pos"])) <= float(point["radius"]) * map.global_scale.x
+	if not in_reach: return
+	_sync_meal_points()
+	meal_dialogue_active = true
+	dialogue_lines.clear()
+	dialogue_index = 0
+	if day_cycle.period not in [1, 3]:
+		message = "现在不是用餐时间，只有中午和晚上可以取饭、吃饭。"
+	elif completed_meals.has(meal_slot):
+		message = "这个时段已经吃过饭了，下一次用餐时间再来吧。"
+	elif action == "canteen_take_meal":
+		if meal_taken:
+			message = "已经取过饭了，请到中间的固定座位吃饭。"
+		else:
+			meal_taken = true
+			message = "取好饭了，去中间亮着光圈的椅子上坐下吃饭吧。"
+	elif not meal_taken:
+		message = "还没有取饭，请先到档口取饭。"
+	else:
+		_start_meal_seating()
+		completed_meals[meal_slot] = true
+		meal_taken = false
+		message = "你坐在椅子上吃完了%s。" % ("午饭" if day_cycle.period == 1 else "晚饭")
+	_sync_time_points()
+
+func _setup_meal_seat_animation() -> void:
+	var frames: SpriteFrames = player.sprite.sprite_frames.duplicate()
+	var standing: AtlasTexture = frames.get_frame_texture(&"idle_right", 0)
+	var seated := AtlasTexture.new()
+	seated.atlas = standing.atlas
+	# 服装齐全的屈膝坐姿，后面的扩展动作没有上衣，不能用于吃饭。
+	seated.region = Rect2(128, 1280, 64, 64)
+	frames.add_animation(&"sit_meal")
+	frames.add_frame(&"sit_meal", seated)
+	player.sprite.sprite_frames = frames
+
+func _start_meal_seating() -> void:
+	meal_return_position = player.global_position
+	meal_saved_sprite_position = player.sprite.position
+	meal_saved_facing = player.facing
+	meal_seated = true
+	player.velocity = Vector2.ZERO
+	$Player/CollisionShape2D.set_deferred("disabled", true)
+	player.global_position = map.to_global(Vector2(560, 295))
+	player.facing = "down"
+	player.sprite.position = Vector2(0, -28)
+	player.pose_override = &"sit_meal"
+	player.sprite.play(&"sit_meal")
+
+func _end_meal_seating() -> void:
+	if not meal_seated: return
+	meal_seated = false
+	player.global_position = meal_return_position
+	player.sprite.position = meal_saved_sprite_position
+	player.facing = meal_saved_facing
+	player.pose_override = &""
+	player.sprite.play("idle_" + player.facing)
+	player.velocity = Vector2.ZERO
+	$Player/CollisionShape2D.set_deferred("disabled", false)
