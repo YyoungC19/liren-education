@@ -2,14 +2,20 @@ extends Node2D
 
 @export var cb_portrait: Texture2D
 
+# 室外总面积倍率；长宽分别乘以平方根，人物大小不变。
+@export_range(1.0, 4.0, 0.05) var outdoor_area_multiplier: float = 1.25
+@export_range(0.5, 3.0, 0.05) var outdoor_zoom_multiplier: float = 1.25
+
 @onready var map = $Map
 @onready var player = $Player
 @onready var npc = $NPC
 @onready var camera: Camera2D = $Player/Camera2D
 @onready var hud: Label = $HUD/StatusLabel
 
+var game_menu: CanvasLayer
 var place: String = ""
 var dorm_transition_cooldown: float = 0.0
+var teaching_restroom_return_floor: int = 1
 var message: String = ""
 
 var dialogue_lines: PackedStringArray = []
@@ -28,6 +34,9 @@ var portrait_image: TextureRect
 func _ready() -> void:
 	_setup_dialogue()
 	_setup_noticeboard()
+	game_menu = load("res://scripts/rpg_menu.gd").new()
+	add_child(game_menu)
+	game_menu.menu_state_changed.connect(_sync_player_controls)
 	_load_place("校园 G0", Vector2(800, 2020))
 
 
@@ -36,12 +45,12 @@ func _process(_delta: float) -> void:
 	_update_dorm_stairs()
 	_update_dialogue()
 
-	if place in ["教学楼 F2", "教学楼 F3", "食堂内部", "白房内部", "二层第一教室"]:
+	if place in ["教学楼 F2", "教学楼 F3", "教学楼 F4", "教学楼 F5", "教学楼男厕", "食堂内部", "二号空房间", "小卖部内部", "白房内部", "二层第一教室", "一楼办公室"]:
 		_frame_area()
 
-	player.movement_enabled = message.is_empty() and not noticeboard_view.visible
+	_sync_player_controls()
 
-	var hint := "靠近光圈，按 E 互动"
+	var hint := "靠近门或可交互物品，按 E 互动"
 	if place in ["男生宿舍内部", "男生宿舍 F2", "男生宿舍 F3"]:
 		hint = "走上右端楼梯自动换层，房门按 E 互动"
 	var nearby := _nearest_point()
@@ -59,8 +68,8 @@ func _process(_delta: float) -> void:
 	if place == "男生宿舍内部":
 		area_name = "男生宿舍 F1 · 楼梯间"
 
-	if place == "教学楼前平台":
-		area_name = "教学楼 F1 · 开放平台"
+	if place in ["教学楼前平台", "休息区"]:
+		area_name = "休息区" if map.to_local(player.global_position).x < -225.0 else "教学楼 F1 · 开放平台"
 	elif place == "二层第一教室":
 		area_name = "二层 · cb 教室"
 
@@ -68,7 +77,7 @@ func _process(_delta: float) -> void:
 		player.display_name
 		+ "  |  "
 		+ area_name
-		+ "\n方向键 / WASD 移动，E 互动\n"
+		+ "\n方向键 / WASD 移动，E 互动\nX 菜单 · G 手表\n"
 		+ hint
 	)
 
@@ -227,7 +236,7 @@ func _nearest_point() -> Dictionary:
 
 	if npc.visible:
 		candidates.append({
-			"pos": npc.position,
+			"pos": npc.global_position,
 			"title": "与 " + npc.display_name + " 对话",
 			"action": "cb",
 			"radius": 80.0
@@ -235,16 +244,21 @@ func _nearest_point() -> Dictionary:
 
 	for point in candidates:
 		var target: Vector2 = point["pos"]
-		if point.has("interaction_rect"):
-			var area: Rect2 = point["interaction_rect"]
-			target = Vector2(clampf(player.position.x, area.position.x, area.end.x), clampf(player.position.y, area.position.y, area.end.y))
 		var radius: float = float(point.get("radius", 80.0))
-		var distance: float = player.position.distance_to(target)
-
+		if str(point["action"]) != "cb":
+			if point.has("interaction_rect"):
+				var area: Rect2 = point["interaction_rect"]
+				var local_player: Vector2 = map.to_local(player.global_position)
+				target = Vector2(
+					clampf(local_player.x, area.position.x, area.end.x),
+					clampf(local_player.y, area.position.y, area.end.y)
+				)
+			target = map.to_global(target)
+			radius *= map.global_scale.x
+		var distance: float = player.global_position.distance_to(target)
 		if distance <= radius and distance < best_distance:
 			best_distance = distance
 			result = point
-
 	return result
 
 
@@ -270,7 +284,7 @@ func _interact() -> void:
 			dialogue_lines.clear()
 			dialogue_index = 0
 
-		player.movement_enabled = message.is_empty() and not noticeboard_view.visible
+		_sync_player_controls()
 		_update_dialogue()
 		return
 
@@ -282,6 +296,9 @@ func _interact() -> void:
 	var action: String = point["action"]
 
 	match action:
+		"rest_dorm_locked":
+			message = "这边是宿舍，暂时不能进入。"
+
 		"noticeboard":
 			noticeboard_view.show()
 
@@ -302,6 +319,40 @@ func _interact() -> void:
 
 		"side_down":
 			_load_place("校园 G0", Vector2(1690, 1290))
+
+		"teaching_west_up":
+			_enter_teaching_west_floor(map._teaching_floor_number() + 1)
+
+		"teaching_west_down":
+			_enter_teaching_west_floor(map._teaching_floor_number() - 1)
+
+		"teaching_up":
+			_enter_teaching_floor(map._teaching_floor_number() + 1)
+
+		"teaching_down":
+			_enter_teaching_floor(map._teaching_floor_number() - 1)
+
+		"teaching_restroom":
+			var floor_number: int = int(point["floor"])
+			if floor_number % 2 == 0:
+				message = "这是女厕所，仅限女生进入。"
+			else:
+				teaching_restroom_return_floor = floor_number
+				_load_place("教学楼男厕", Vector2(1430, 600))
+
+		"restroom_stall_toggle":
+			if not map.toggle_restroom_stall(int(point["stall_index"]), map.to_local(player.global_position)):
+				message = "请先离开门口，再关闭隔间门。"
+
+		"teaching_restroom_exit":
+			if teaching_restroom_return_floor == 1:
+				_load_place("教学楼前平台", Vector2(1240, 1200))
+			else:
+				var top: float = map.teaching_top_for_floor(teaching_restroom_return_floor)
+				_load_place("教学楼 F%d" % teaching_restroom_return_floor, Vector2(1240, top + 130))
+
+		"teaching_water":
+			message = "这里可以装水。"
 
 		"upstairs":
 			_load_place("教学楼 F2", Vector2(1120, 416))
@@ -326,6 +377,12 @@ func _interact() -> void:
 
 		"exit_classroom_back":
 			_load_place("教学楼 F2", Vector2(630, 410))
+
+		"office_enter":
+			_load_place("一楼办公室", Vector2(450, 530))
+
+		"office_exit":
+			_load_place("教学楼前平台", Vector2(990, 1225))
 
 		"room_closed":
 			message = str(point["title"]) + "暂未开放。"
@@ -363,20 +420,32 @@ func _interact() -> void:
 		"dorm_room_closed":
 			message = "这是别人的宿舍，不能进入。"
 
+		"second_room_enter":
+			_load_place("二号空房间", Vector2(160, 190))
+
+		"second_room_exit":
+			_load_place("校园 G0", Vector2(2360, 1380))
+
+		"shop_enter":
+			_load_place("小卖部内部", Vector2(190, 500))
+
+		"shop_exit":
+			_load_place("校园 G0", Vector2(2680, 1015))
+
 		"canteen_from_left":
 			_load_place("食堂内部", Vector2(180, 500))
 
 		"canteen_from_upper":
-			_load_place("食堂内部", Vector2(700, 180))
+			_load_place("食堂内部", Vector2(1150, 180))
 
 		"canteen_exit_left":
 			_load_place("校园 G0", Vector2(1370, 1780))
 
 		"canteen_exit_upper":
-			_load_place("校园 G0", Vector2(1800, 1380))
+			_load_place("校园 G0", Vector2(2110, 1380))
 
 
-	player.movement_enabled = message.is_empty() and not noticeboard_view.visible
+	_sync_player_controls()
 	_update_dialogue()
 
 
@@ -394,25 +463,23 @@ func _load_place(next_place: String, spawn: Vector2) -> void:
 	map.configure(place)
 	npc.set_active(place == "二层第一教室")
 
-	player.position = spawn
+	var outside: bool = place in ["校园 G0", "教学楼前平台", "休息区"]
+	var world_scale: float = sqrt(outdoor_area_multiplier) if outside else 1.0
+	map.scale = Vector2.ONE * world_scale
+	player.position = spawn * world_scale
 	player.velocity = Vector2.ZERO
 	player.movement_enabled = true
 
-	var outside: bool = (
-		place == "校园 G0"
-		or place == "教学楼前平台"
-	)
-
-	camera.zoom = Vector2(0.75, 0.75) if outside else Vector2.ONE
-	camera.limit_left = 0
-	camera.limit_top = 0
-	camera.limit_right = int(map.map_size.x)
-	camera.limit_bottom = int(map.map_size.y)
+	camera.zoom = Vector2.ONE * (0.75 * outdoor_zoom_multiplier if outside else 1.0)
+	camera.limit_left = floori(map.map_origin.x * world_scale)
+	camera.limit_top = floori(map.map_origin.y * world_scale)
+	camera.limit_right = ceili((map.map_origin.x + map.map_size.x) * world_scale)
+	camera.limit_bottom = ceili((map.map_origin.y + map.map_size.y) * world_scale)
 	camera.position = Vector2.ZERO
 
 	_update_dialogue()
 
-	if place in ["教学楼 F2", "教学楼 F3", "食堂内部", "白房内部", "二层第一教室"]:
+	if place in ["教学楼 F2", "教学楼 F3", "教学楼 F4", "教学楼 F5", "教学楼男厕", "食堂内部", "二号空房间", "小卖部内部", "白房内部", "二层第一教室", "一楼办公室"]:
 		_frame_area()
 
 	camera.reset_smoothing()
@@ -442,7 +509,7 @@ func _frame_area() -> void:
 
 	camera.zoom = Vector2.ONE * fit
 	camera.position = (
-		map.map_size * 0.5
+		map.map_origin + map.map_size * 0.5
 		- player.position
 		+ Vector2(0, reserved / (2.0 * fit))
 	)
@@ -453,7 +520,7 @@ func _frame_area() -> void:
 	camera.limit_bottom = 100000
 
 func _update_dorm_stairs() -> void:
-	if dorm_transition_cooldown > 0.0 or not message.is_empty() or noticeboard_view.visible:
+	if dorm_transition_cooldown > 0.0 or not message.is_empty() or noticeboard_view.visible or (game_menu != null and game_menu.is_open()):
 		return
 	if place not in ["男生宿舍内部", "男生宿舍 F2", "男生宿舍 F3"]:
 		return
@@ -499,3 +566,23 @@ func _setup_noticeboard() -> void:
 	close_hint.anchor_top = 0.82
 	close_hint.anchor_bottom = 0.9
 	noticeboard_view.hide()
+
+func _enter_teaching_floor(floor_number: int) -> void:
+	if floor_number <= 1:
+		_load_place("教学楼前平台", Vector2(1120, 1200))
+		return
+	if floor_number > 5:
+		return
+	var top: float = map.teaching_top_for_floor(floor_number)
+	_load_place("教学楼 F%d" % floor_number, Vector2(1120, top + 136))
+func _enter_teaching_west_floor(floor_number: int) -> void:
+	if floor_number <= 1:
+		_load_place("教学楼前平台", Vector2(-100, 1200))
+		return
+	if floor_number > 5:
+		return
+	var top: float = map.teaching_top_for_floor(floor_number)
+	_load_place("教学楼 F%d" % floor_number, Vector2(-20, top + 136))
+
+func _sync_player_controls() -> void:
+	player.movement_enabled = message.is_empty() and not noticeboard_view.visible and (game_menu == null or not game_menu.is_open())
